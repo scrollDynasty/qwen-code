@@ -60,16 +60,19 @@ function recordRebuild(stateKey: string): void {
 interface ChangeState {
   gitRootMtimeMs: number | null;
   untrackedFingerprint: string | null;
+  deletedFingerprint: string | null;
   fileList: string[];
 }
 
 const changeStateMap = new Map<string, ChangeState>();
 
 function resolveGitDir(crawlDirectory: string): string | null {
-  try {
-    let current = crawlDirectory;
-    while (current) {
-      const gitPath = path.join(current, '.git');
+  let current = crawlDirectory;
+
+  while (current) {
+    const gitPath = path.join(current, '.git');
+
+    try {
       const stat = fs.statSync(gitPath);
 
       if (stat.isDirectory()) {
@@ -88,13 +91,18 @@ function resolveGitDir(crawlDirectory: string): string | null {
           ? resolvedGitDir
           : path.resolve(current, resolvedGitDir);
       }
-
-      const parent = path.dirname(current);
-      if (parent === current) break;
-      current = parent;
+    } catch (error) {
+      const errno = error as NodeJS.ErrnoException;
+      if (errno.code !== 'ENOENT') {
+        return null;
+      }
     }
-  } catch {
-    // Ignore errors when .git metadata is missing or unreadable.
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
   }
 
   return null;
@@ -139,6 +147,7 @@ function updateChangeState(
   crawlDirectory: string,
   fileList: string[],
   untrackedFiles?: string[],
+  deletedFiles?: string[],
 ): void {
   const mtime = getGitRootMtime(crawlDirectory);
   changeStateMap.set(stateKey, {
@@ -147,6 +156,8 @@ function updateChangeState(
       untrackedFiles === undefined
         ? null
         : computeLinesFingerprint(untrackedFiles),
+    deletedFingerprint:
+      deletedFiles === undefined ? null : computeLinesFingerprint(deletedFiles),
     fileList,
   });
 }
@@ -420,10 +431,6 @@ function hasReachedFileBudget(
   return maxFiles !== undefined && fileSet.size >= maxFiles;
 }
 
-function existingTrackedPath(gitRoot: string, normalizedFile: string): boolean {
-  return fs.existsSync(path.join(gitRoot, normalizedFile));
-}
-
 async function listUntrackedFiles(
   gitRoot: string,
   relativeToGitRoot: string,
@@ -450,12 +457,37 @@ async function listUntrackedFiles(
   return untrackedResult.lines.map((file) => normalizePath(file));
 }
 
-async function hasUntrackedFilesChanged(
+async function listDeletedTrackedFiles(
+  gitRoot: string,
+  relativeToGitRoot: string,
+): Promise<string[] | null> {
+  const deletedArgs = ['ls-files', '--deleted'];
+  if (relativeToGitRoot && relativeToGitRoot !== '.') {
+    deletedArgs.push(relativeToGitRoot);
+  }
+
+  const deletedResult = await commandRunner(
+    'git',
+    deletedArgs,
+    gitRoot,
+    10_000,
+  );
+  if (!deletedResult.success) {
+    return null;
+  }
+
+  return deletedResult.lines.map((file) => normalizePath(file));
+}
+
+async function hasWorkingTreeFilesChanged(
   state: ChangeState,
   crawlDirectory: string,
   useGitignore: boolean,
 ): Promise<boolean> {
-  if (state.untrackedFingerprint === null) {
+  if (
+    state.untrackedFingerprint === null &&
+    state.deletedFingerprint === null
+  ) {
     return false;
   }
 
@@ -474,7 +506,18 @@ async function hasUntrackedFilesChanged(
     return true;
   }
 
-  return computeLinesFingerprint(untrackedFiles) !== state.untrackedFingerprint;
+  const deletedFiles = await listDeletedTrackedFiles(
+    gitRoot,
+    relativeToGitRoot,
+  );
+  if (deletedFiles === null) {
+    return true;
+  }
+
+  return (
+    computeLinesFingerprint(untrackedFiles) !== state.untrackedFingerprint ||
+    computeLinesFingerprint(deletedFiles) !== state.deletedFingerprint
+  );
 }
 
 async function crawlWithGitLsFiles(
@@ -513,6 +556,17 @@ async function crawlWithGitLsFiles(
     options.useGitignore !== false,
   );
 
+  const deletedFiles = await listDeletedTrackedFiles(
+    gitRoot,
+    relativeToGitRoot,
+  );
+
+  if (untrackedFiles === null || deletedFiles === null) {
+    return { success: false, files: [], isGitRepo: true };
+  }
+
+  const deletedSet = new Set(deletedFiles);
+
   const fileSet = new Set<string>();
   let count = 0;
 
@@ -523,7 +577,7 @@ async function crawlWithGitLsFiles(
 
     await maybeYield(count++);
     const normalizedFile = normalizePath(file);
-    if (!existingTrackedPath(gitRoot, normalizedFile)) {
+    if (deletedSet.has(normalizedFile)) {
       continue;
     }
 
@@ -574,7 +628,8 @@ async function crawlWithGitLsFiles(
     stateKey,
     crawlDirectory,
     filteredResults,
-    untrackedFiles ?? undefined,
+    untrackedFiles,
+    deletedFiles,
   );
   recordRebuild(stateKey);
 
@@ -713,7 +768,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
     if (!needReCrawl) {
       const state = changeStateMap.get(stateKey);
       if (state) {
-        const untrackedChanged = await hasUntrackedFilesChanged(
+        const untrackedChanged = await hasWorkingTreeFilesChanged(
           state,
           options.crawlDirectory,
           options.useGitignore !== false,

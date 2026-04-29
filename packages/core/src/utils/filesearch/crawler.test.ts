@@ -785,6 +785,31 @@ describe('crawler', () => {
       );
     });
 
+    it('should resolve the git root from a subdirectory crawl', async () => {
+      tmpDir = await createTmpDir({
+        src: ['file2.js'],
+      });
+      await initGitRepo(tmpDir);
+
+      const ignore = loadIgnoreRules({
+        projectRoot: tmpDir,
+        useGitignore: false,
+        useQwenignore: false,
+        ignoreDirs: [],
+      });
+
+      const results = await crawl({
+        crawlDirectory: path.join(tmpDir, 'src'),
+        cwd: tmpDir,
+        ignore,
+        cache: false,
+        cacheTtl: 0,
+      });
+
+      expect(results).toContain('src/file2.js');
+      expect(results).toContain('src/');
+    });
+
     it('should not include tracked files deleted from the working tree', async () => {
       tmpDir = await createTmpDir({
         'alive.txt': '',
