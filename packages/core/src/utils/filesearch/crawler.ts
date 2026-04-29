@@ -41,7 +41,9 @@ function getStateKey(options: CrawlOptions): string {
     normalizePath(options.crawlDirectory),
     normalizePath(options.cwd),
     options.ignore.getFingerprint(),
+    options.useGitignore === false ? 'no-gitignore' : 'gitignore',
     options.maxDepth === undefined ? 'undefined' : String(options.maxDepth),
+    options.maxFiles === undefined ? 'undefined' : String(options.maxFiles),
   ].join('|');
 }
 
@@ -697,6 +699,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
       options.ignore.getFingerprint(),
       options.maxDepth,
       options.maxFiles,
+      options.useGitignore !== false,
     );
     const cachedResults = cache.read(cacheKey);
     if (cachedResults) {
@@ -716,7 +719,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
           options.useGitignore !== false,
         );
         if (!untrackedChanged) {
-          return applyMaxFilesLimit(state.fileList, options.maxFiles);
+          return state.fileList;
         }
       }
     }
@@ -729,7 +732,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
     options,
   );
   if (gitResult.success) {
-    const results = applyMaxFilesLimit(gitResult.files, options.maxFiles);
+    const results = gitResult.files;
 
     if (options.cache) {
       const cacheKey = cache.getCacheKey(
@@ -737,6 +740,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
         options.ignore.getFingerprint(),
         options.maxDepth,
         options.maxFiles,
+        options.useGitignore !== false,
       );
       cache.write(cacheKey, results, options.cacheTtl * 1000);
     }
@@ -752,7 +756,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
       options,
     );
     if (rgResult.success) {
-      const results = applyMaxFilesLimit(rgResult.files, options.maxFiles);
+      const results = rgResult.files;
 
       if (options.cache) {
         const cacheKey = cache.getCacheKey(
@@ -760,6 +764,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
           options.ignore.getFingerprint(),
           options.maxDepth,
           options.maxFiles,
+          options.useGitignore !== false,
         );
         cache.write(cacheKey, results, options.cacheTtl * 1000);
       }
@@ -779,6 +784,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
       options.ignore.getFingerprint(),
       options.maxDepth,
       options.maxFiles,
+      options.useGitignore !== false,
     );
     cache.write(cacheKey, limitedResults, options.cacheTtl * 1000);
   }

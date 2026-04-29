@@ -921,6 +921,32 @@ describe('crawler', () => {
       expect(withGitignoreResults).toContain('keep.txt');
     });
 
+    it('should not drop files after directory expansion when maxFiles is small', async () => {
+      tmpDir = await createTmpDir({
+        nested: ['deep.txt'],
+      });
+      await initGitRepo(tmpDir);
+
+      const ignore = loadIgnoreRules({
+        projectRoot: tmpDir,
+        useGitignore: false,
+        useQwenignore: false,
+        ignoreDirs: [],
+      });
+
+      const results = await crawl({
+        crawlDirectory: tmpDir,
+        cwd: tmpDir,
+        ignore,
+        useGitignore: false,
+        cache: false,
+        cacheTtl: 0,
+        maxFiles: 1,
+      });
+
+      expect(results).toContain('nested/deep.txt');
+    });
+
     it('should include gitignored files in non-git rg fallback when useGitignore is false', async () => {
       const rgArgsSeen: string[][] = [];
 
