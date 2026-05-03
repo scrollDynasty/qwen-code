@@ -6,7 +6,7 @@
 
 import path from 'node:path';
 import fs from 'node:fs';
-import { execFile } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { fdir } from 'fdir';
 import type { Ignore } from './ignore.js';
 import * as cache from './crawlCache.js';
@@ -178,30 +178,153 @@ interface CommandResult {
   lines: string[];
 }
 
+interface RunCommandOptions {
+  maxLines?: number;
+  collectLines?: boolean;
+  onLine?: (line: string) => boolean;
+}
+
 function runCommand(
   command: string,
   args: string[],
   cwd: string,
   timeoutMs: number = 20_000,
+  options?: RunCommandOptions,
 ): Promise<CommandResult> {
+  const maxLines = options?.maxLines;
+  const collectLines = options?.collectLines !== false;
+
+  if (maxLines !== undefined && maxLines <= 0) {
+    return Promise.resolve({ success: true, lines: [] });
+  }
+
   return new Promise((resolve) => {
-    const child = execFile(
-      command,
-      args,
-      { cwd, timeout: timeoutMs, maxBuffer: 20_000_000, windowsHide: true },
-      (error, stdout = '') => {
-        if (error) {
-          resolve({ success: false, lines: [] });
-          return;
+    const lines: string[] = [];
+    let settled = false;
+    let timedOut = false;
+    let killedByLimit = false;
+    let streamBuffer = '';
+
+    const finalize = (success: boolean, resultLines: string[]): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({ success, lines: resultLines });
+    };
+
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      finalize(false, []);
+      return;
+    }
+
+    const stopProcess = (): void => {
+      if (child.killed) {
+        return;
+      }
+      try {
+        child.kill();
+      } catch {
+        // Ignore kill failures.
+      }
+    };
+
+    const processLine = (line: string): boolean => {
+      const normalized = line.endsWith('\r') ? line.slice(0, -1) : line;
+      if (normalized.length === 0) {
+        return true;
+      }
+
+      if (collectLines) {
+        lines.push(normalized);
+      }
+
+      if (options?.onLine && !options.onLine(normalized)) {
+        killedByLimit = true;
+        stopProcess();
+        return false;
+      }
+
+      if (maxLines !== undefined && lines.length >= maxLines) {
+        killedByLimit = true;
+        stopProcess();
+        return false;
+      }
+
+      return true;
+    };
+
+    const processChunk = (chunk: string): void => {
+      streamBuffer += chunk;
+
+      while (true) {
+        const newlineIndex = streamBuffer.indexOf('\n');
+        if (newlineIndex === -1) {
+          break;
         }
-        const lines = stdout
-          .split('\n')
-          .map((l) => l)
-          .filter((l) => l.length > 0);
-        resolve({ success: true, lines });
-      },
-    );
-    child.on('error', () => resolve({ success: false, lines: [] }));
+
+        const line = streamBuffer.slice(0, newlineIndex);
+        streamBuffer = streamBuffer.slice(newlineIndex + 1);
+        if (!processLine(line)) {
+          break;
+        }
+      }
+    };
+
+    const flushRemainder = (): void => {
+      if (streamBuffer.length === 0) {
+        return;
+      }
+      processLine(streamBuffer);
+      streamBuffer = '';
+    };
+
+    let timeout: NodeJS.Timeout | undefined;
+    if (timeoutMs > 0) {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        stopProcess();
+      }, timeoutMs);
+    }
+
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      processChunk(chunk);
+    });
+
+    child.on('error', () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      finalize(false, []);
+    });
+
+    child.on('close', (code) => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+
+      if (timedOut) {
+        finalize(false, []);
+        return;
+      }
+
+      if (killedByLimit) {
+        finalize(true, lines);
+        return;
+      }
+
+      flushRemainder();
+
+      finalize(code === 0, code === 0 ? lines : []);
+    });
   });
 }
 
@@ -540,16 +663,6 @@ async function crawlWithGitLsFiles(
   if (relativeToGitRoot && relativeToGitRoot !== '.') {
     trackedArgs.push(relativeToGitRoot);
   }
-  const trackedResult = await commandRunner(
-    'git',
-    trackedArgs,
-    gitRoot,
-    20_000,
-  );
-  if (!trackedResult.success) {
-    return { success: false, files: [], isGitRepo: true };
-  }
-
   const untrackedFiles = await listUntrackedFiles(
     gitRoot,
     relativeToGitRoot,
@@ -568,17 +681,14 @@ async function crawlWithGitLsFiles(
   const deletedSet = new Set(deletedFiles);
 
   const fileSet = new Set<string>();
-  let count = 0;
-
-  for (const file of trackedResult.lines) {
+  const processTrackedFile = (file: string): boolean => {
     if (hasReachedFileBudget(fileSet, options.maxFiles)) {
-      break;
+      return false;
     }
 
-    await maybeYield(count++);
     const normalizedFile = normalizePath(file);
     if (deletedSet.has(normalizedFile)) {
-      continue;
+      return true;
     }
 
     const fullPath =
@@ -590,11 +700,34 @@ async function crawlWithGitLsFiles(
         : path.posix.join(relativeToCrawlDir, normalizedFile);
 
     if (!shouldIncludeFile(fullPath, dirFilter, fileFilter)) {
-      continue;
+      return true;
     }
 
     fileSet.add(fullPath);
+    return !hasReachedFileBudget(fileSet, options.maxFiles);
+  };
+
+  const trackedResult = await commandRunner(
+    'git',
+    trackedArgs,
+    gitRoot,
+    20_000,
+    {
+      collectLines: false,
+      onLine: processTrackedFile,
+    },
+  );
+  if (!trackedResult.success) {
+    return { success: false, files: [], isGitRepo: true };
   }
+
+  for (const file of trackedResult.lines) {
+    if (!processTrackedFile(file)) {
+      break;
+    }
+  }
+
+  let count = 0;
 
   if (untrackedFiles !== null) {
     for (const normalizedFile of untrackedFiles) {
@@ -660,32 +793,39 @@ async function crawlWithRipgrep(
     rgArgs.push('--no-ignore');
   }
 
-  const rgResult = await commandRunner('rg', rgArgs, crawlDirectory, 20_000);
-
-  if (!rgResult.success) {
-    return { success: false, files: [] };
-  }
-
   const relativeToCrawlDir = getPosixRelative(cwd, crawlDirectory);
   const dirFilter = options.ignore.getDirectoryFilter();
   const fileFilter = options.ignore.getFileFilter();
 
   const fileSet = new Set<string>();
-  let count = 0;
-  for (const file of rgResult.lines) {
+  const processRgFile = (file: string): boolean => {
     if (hasReachedFileBudget(fileSet, options.maxFiles)) {
-      break;
+      return false;
     }
 
-    await maybeYield(count++);
     const normalizedFile = normalizePath(file);
-
     const fullPath = path.posix.join(relativeToCrawlDir, normalizedFile);
     if (!shouldIncludeFile(fullPath, dirFilter, fileFilter)) {
-      continue;
+      return true;
     }
 
     fileSet.add(fullPath);
+    return !hasReachedFileBudget(fileSet, options.maxFiles);
+  };
+
+  const rgResult = await commandRunner('rg', rgArgs, crawlDirectory, 20_000, {
+    collectLines: false,
+    onLine: processRgFile,
+  });
+
+  if (!rgResult.success) {
+    return { success: false, files: [] };
+  }
+
+  for (const file of rgResult.lines) {
+    if (!processRgFile(file)) {
+      break;
+    }
   }
 
   const results = buildResultsFromFileSet(fileSet);
@@ -829,9 +969,9 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
   }
 
   const fdirResults = await crawlWithFdir(options);
-  updateChangeState(stateKey, options.crawlDirectory, fdirResults);
-  recordRebuild(stateKey);
   const limitedResults = applyMaxFilesLimit(fdirResults, options.maxFiles);
+  updateChangeState(stateKey, options.crawlDirectory, limitedResults);
+  recordRebuild(stateKey);
 
   if (options.cache) {
     const cacheKey = cache.getCacheKey(

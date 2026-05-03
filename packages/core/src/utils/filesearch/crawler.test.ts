@@ -1122,6 +1122,44 @@ describe('crawler', () => {
         vi.useRealTimers();
       }
     });
+
+    it('should preserve maxFiles cap on throttled non-git fallback reads', async () => {
+      __setCommandRunnerForTests(async (command) => {
+        if (command === 'git' || command === 'rg') {
+          return { success: false, lines: [] };
+        }
+        return { success: false, lines: [] };
+      });
+
+      tmpDir = await createTmpDir({
+        'file1.js': '',
+        'file2.js': '',
+        'file3.js': '',
+      });
+      const ignore = loadIgnoreRules({
+        projectRoot: tmpDir,
+        useGitignore: false,
+        useQwenignore: false,
+        ignoreDirs: [],
+      });
+      const options = {
+        crawlDirectory: tmpDir,
+        cwd: tmpDir,
+        ignore,
+        cache: false,
+        cacheTtl: 0,
+        maxFiles: 1,
+      };
+
+      const first = await crawl(options);
+      expect(first).toHaveLength(1);
+
+      await fs.writeFile(path.join(tmpDir, 'file4.js'), '');
+
+      const second = await crawl(options);
+      expect(second).toHaveLength(1);
+      expect(second).toEqual(first);
+    });
   });
 
   describe('mtime-based change detection', () => {
