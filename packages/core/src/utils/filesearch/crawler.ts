@@ -66,7 +66,16 @@ interface ChangeState {
 
 const changeStateMap = new Map<string, ChangeState>();
 
+const resolveGitDirCache = new Map<string, string | null>();
+const canonicalizePathCache = new Map<string, string>();
+
 function resolveGitDir(crawlDirectory: string): string | null {
+  const cacheKey = normalizePath(path.resolve(crawlDirectory));
+  const cached = resolveGitDirCache.get(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
   let current = crawlDirectory;
 
   while (current) {
@@ -76,6 +85,7 @@ function resolveGitDir(crawlDirectory: string): string | null {
       const stat = fs.statSync(gitPath);
 
       if (stat.isDirectory()) {
+        resolveGitDirCache.set(cacheKey, gitPath);
         return gitPath;
       }
 
@@ -83,17 +93,21 @@ function resolveGitDir(crawlDirectory: string): string | null {
         const contents = fs.readFileSync(gitPath, 'utf8').trim();
         const match = contents.match(/^gitdir:\s*(.+)$/i);
         if (!match) {
+          resolveGitDirCache.set(cacheKey, null);
           return null;
         }
 
         const resolvedGitDir = match[1].trim();
-        return path.isAbsolute(resolvedGitDir)
+        const resolved = path.isAbsolute(resolvedGitDir)
           ? resolvedGitDir
           : path.resolve(current, resolvedGitDir);
+        resolveGitDirCache.set(cacheKey, resolved);
+        return resolved;
       }
     } catch (error) {
       const errno = error as NodeJS.ErrnoException;
       if (errno.code !== 'ENOENT') {
+        resolveGitDirCache.set(cacheKey, null);
         return null;
       }
     }
@@ -105,6 +119,7 @@ function resolveGitDir(crawlDirectory: string): string | null {
     current = parent;
   }
 
+  resolveGitDirCache.set(cacheKey, null);
   return null;
 }
 
@@ -299,10 +314,12 @@ function runCommand(
       processChunk(chunk);
     });
 
-    child.on('error', () => {
+    child.on('error', (err: NodeJS.ErrnoException) => {
       if (timeout) {
         clearTimeout(timeout);
       }
+      // eslint-disable-next-line no-console -- surfaced for spawn diagnostics (ENOENT, EACCES, …)
+      console.warn('[crawler] command spawn failed:', command, err.code ?? err);
       finalize(false, []);
     });
 
@@ -338,6 +355,8 @@ export function __setCommandRunnerForTests(runner?: CommandRunner): void {
 export function __resetCrawlerStateForTests(): void {
   lastRebuildTime.clear();
   changeStateMap.clear();
+  resolveGitDirCache.clear();
+  canonicalizePathCache.clear();
 }
 
 function normalizePath(p: string): string {
@@ -353,10 +372,21 @@ function normalizeForComparison(p: string): string {
 }
 
 function canonicalizePath(p: string): string {
+  const resolvedInput = path.resolve(p);
+  const cacheKey = normalizePath(resolvedInput);
+  const hit = canonicalizePathCache.get(cacheKey);
+  if (hit !== undefined) {
+    return hit;
+  }
+
   try {
-    return fs.realpathSync.native(p);
+    const out = fs.realpathSync.native(resolvedInput);
+    canonicalizePathCache.set(cacheKey, out);
+    return out;
   } catch {
-    return path.resolve(p);
+    const fallback = resolvedInput;
+    canonicalizePathCache.set(cacheKey, fallback);
+    return fallback;
   }
 }
 
@@ -602,45 +632,56 @@ async function listDeletedTrackedFiles(
   return deletedResult.lines.map((file) => normalizePath(file));
 }
 
-async function hasWorkingTreeFilesChanged(
+interface GitWorkingTreePrefetch {
+  gitRoot: string;
+  untrackedFiles: string[];
+  deletedFiles: string[];
+}
+
+interface WorkingTreeChangeScan {
+  changed: boolean;
+  /** Lists from this scan; pass into `crawlWithGitLsFiles` to avoid duplicate git calls. */
+  prefetch?: GitWorkingTreePrefetch;
+}
+
+async function scanWorkingTreeForChange(
   state: ChangeState,
   crawlDirectory: string,
   useGitignore: boolean,
-): Promise<boolean> {
+): Promise<WorkingTreeChangeScan> {
   if (
     state.untrackedFingerprint === null &&
     state.deletedFingerprint === null
   ) {
-    return false;
+    return { changed: false };
   }
 
   const gitRoot = await findGitRoot(crawlDirectory);
   if (!gitRoot) {
-    return true;
+    return { changed: true };
   }
 
   const relativeToGitRoot = getPosixRelative(gitRoot, crawlDirectory);
-  const untrackedFiles = await listUntrackedFiles(
-    gitRoot,
-    relativeToGitRoot,
-    useGitignore,
-  );
-  if (untrackedFiles === null) {
-    return true;
+  const [untrackedFiles, deletedFiles] = await Promise.all([
+    listUntrackedFiles(gitRoot, relativeToGitRoot, useGitignore),
+    listDeletedTrackedFiles(gitRoot, relativeToGitRoot),
+  ]);
+  if (untrackedFiles === null || deletedFiles === null) {
+    return { changed: true };
   }
 
-  const deletedFiles = await listDeletedTrackedFiles(
-    gitRoot,
-    relativeToGitRoot,
-  );
-  if (deletedFiles === null) {
-    return true;
-  }
-
-  return (
+  const changed =
     computeLinesFingerprint(untrackedFiles) !== state.untrackedFingerprint ||
-    computeLinesFingerprint(deletedFiles) !== state.deletedFingerprint
-  );
+    computeLinesFingerprint(deletedFiles) !== state.deletedFingerprint;
+
+  if (!changed) {
+    return { changed: false };
+  }
+
+  return {
+    changed: true,
+    prefetch: { gitRoot, untrackedFiles, deletedFiles },
+  };
 }
 
 async function crawlWithGitLsFiles(
@@ -648,8 +689,35 @@ async function crawlWithGitLsFiles(
   crawlDirectory: string,
   cwd: string,
   options: CrawlOptions,
+  workingTreePrefetch?: GitWorkingTreePrefetch,
 ): Promise<{ success: boolean; files: string[]; isGitRepo: boolean }> {
-  const gitRoot = await findGitRoot(crawlDirectory);
+  let gitRoot: string | null;
+  let untrackedFiles: string[] | null;
+  let deletedFiles: string[] | null;
+
+  if (workingTreePrefetch) {
+    gitRoot = workingTreePrefetch.gitRoot;
+    untrackedFiles = workingTreePrefetch.untrackedFiles;
+    deletedFiles = workingTreePrefetch.deletedFiles;
+  } else {
+    gitRoot = await findGitRoot(crawlDirectory);
+    if (!gitRoot) {
+      return { success: false, files: [], isGitRepo: false };
+    }
+
+    const relativeToGitRootForLists = getPosixRelative(gitRoot, crawlDirectory);
+    const lists = await Promise.all([
+      listUntrackedFiles(
+        gitRoot,
+        relativeToGitRootForLists,
+        options.useGitignore !== false,
+      ),
+      listDeletedTrackedFiles(gitRoot, relativeToGitRootForLists),
+    ]);
+    untrackedFiles = lists[0];
+    deletedFiles = lists[1];
+  }
+
   if (!gitRoot) {
     return { success: false, files: [], isGitRepo: false };
   }
@@ -663,16 +731,6 @@ async function crawlWithGitLsFiles(
   if (relativeToGitRoot && relativeToGitRoot !== '.') {
     trackedArgs.push(relativeToGitRoot);
   }
-  const untrackedFiles = await listUntrackedFiles(
-    gitRoot,
-    relativeToGitRoot,
-    options.useGitignore !== false,
-  );
-
-  const deletedFiles = await listDeletedTrackedFiles(
-    gitRoot,
-    relativeToGitRoot,
-  );
 
   if (untrackedFiles === null || deletedFiles === null) {
     return { success: false, files: [], isGitRepo: true };
@@ -721,6 +779,7 @@ async function crawlWithGitLsFiles(
     return { success: false, files: [], isGitRepo: true };
   }
 
+  // Test doubles may return `lines` without streaming `onLine`; drain any leftovers.
   for (const file of trackedResult.lines) {
     if (!processTrackedFile(file)) {
       break;
@@ -756,17 +815,18 @@ async function crawlWithGitLsFiles(
 
   const results = buildResultsFromFileSet(fileSet);
   const filteredResults = applyFilters(results, options, relativeToCrawlDir);
+  const limitedResults = applyMaxFilesLimit(filteredResults, options.maxFiles);
 
   updateChangeState(
     stateKey,
     crawlDirectory,
-    filteredResults,
+    limitedResults,
     untrackedFiles,
     deletedFiles,
   );
   recordRebuild(stateKey);
 
-  return { success: true, files: filteredResults, isGitRepo: true };
+  return { success: true, files: limitedResults, isGitRepo: true };
 }
 
 function buildResultsFromFileSet(files: Set<string>): string[] {
@@ -830,10 +890,11 @@ async function crawlWithRipgrep(
 
   const results = buildResultsFromFileSet(fileSet);
   const filteredResults = applyFilters(results, options, relativeToCrawlDir);
+  const limitedResults = applyMaxFilesLimit(filteredResults, options.maxFiles);
 
-  updateChangeState(stateKey, crawlDirectory, filteredResults);
+  updateChangeState(stateKey, crawlDirectory, limitedResults);
   recordRebuild(stateKey);
-  return { success: true, files: filteredResults };
+  return { success: true, files: limitedResults };
 }
 
 async function crawlWithFdir(options: CrawlOptions): Promise<string[]> {
@@ -902,20 +963,23 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
     }
   }
 
+  let workingTreePrefetch: GitWorkingTreePrefetch | undefined;
+
   if (!options.cache) {
     const needReCrawl = hasFileListChanged(stateKey, options.crawlDirectory);
 
     if (!needReCrawl) {
       const state = changeStateMap.get(stateKey);
       if (state) {
-        const untrackedChanged = await hasWorkingTreeFilesChanged(
+        const scan = await scanWorkingTreeForChange(
           state,
           options.crawlDirectory,
           options.useGitignore !== false,
         );
-        if (!untrackedChanged) {
+        if (!scan.changed) {
           return state.fileList;
         }
+        workingTreePrefetch = scan.prefetch;
       }
     }
   }
@@ -925,6 +989,7 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
     options.crawlDirectory,
     options.cwd,
     options,
+    workingTreePrefetch,
   );
   if (gitResult.success) {
     const results = gitResult.files;
@@ -988,8 +1053,20 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
 }
 
 function applyMaxFilesLimit(results: string[], maxFiles?: number): string[] {
-  if (maxFiles !== undefined && results.length > maxFiles) {
-    return results.slice(0, maxFiles);
+  if (maxFiles === undefined || results.length <= maxFiles) {
+    return results;
   }
-  return results;
+
+  const clipped = results.slice(0, maxFiles);
+  const rowIsFile = (e: string): boolean => e !== '.' && !e.endsWith('/');
+  if (clipped.some(rowIsFile)) {
+    return clipped;
+  }
+
+  const firstFileIdx = results.findIndex(rowIsFile);
+  if (firstFileIdx === -1) {
+    return clipped;
+  }
+
+  return results.slice(0, firstFileIdx + 1);
 }
