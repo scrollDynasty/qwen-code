@@ -34,7 +34,76 @@ function toPosixPath(p: string): string {
 }
 
 const THROTTLE_MS = 5_000;
+const PATH_CACHE_TTL_MS = 30_000;
+const MAX_PATH_CACHE_ENTRIES = 200;
+const MAX_CHANGE_STATE_ENTRIES = 50;
+const STDERR_LOG_MAX_CHARS = 4_096;
+
 const lastRebuildTime = new Map<string, number>();
+
+interface Timestamped<T> {
+  value: T;
+  cachedAt: number;
+}
+
+function trimPathCache<T>(map: Map<string, Timestamped<T>>): void {
+  while (map.size > MAX_PATH_CACHE_ENTRIES) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    map.delete(oldest);
+  }
+}
+
+function pathCacheGet<T>(
+  map: Map<string, Timestamped<T>>,
+  key: string,
+): T | undefined {
+  const entry = map.get(key);
+  if (!entry) {
+    return undefined;
+  }
+  if (Date.now() - entry.cachedAt > PATH_CACHE_TTL_MS) {
+    map.delete(key);
+    return undefined;
+  }
+  return entry.value;
+}
+
+function pathCacheSet<T>(
+  map: Map<string, Timestamped<T>>,
+  key: string,
+  value: T,
+): void {
+  map.set(key, { value, cachedAt: Date.now() });
+  trimPathCache(map);
+}
+
+function truncateStderrSnippet(stderr: string): string {
+  const t = stderr.trim();
+  if (t.length <= STDERR_LOG_MAX_CHARS) {
+    return t;
+  }
+  return `${t.slice(0, STDERR_LOG_MAX_CHARS)}…`;
+}
+
+function logCommandProblem(
+  kind: string,
+  command: string,
+  args: string[],
+  detail: { code?: number | null; stderr?: string },
+): void {
+  const parts = [`[crawler] ${kind}:`, command, args.join(' ')];
+  if (detail.code !== undefined && detail.code !== null) {
+    parts.push(`exit=${String(detail.code)}`);
+  }
+  if (detail.stderr && detail.stderr.length > 0) {
+    parts.push(truncateStderrSnippet(detail.stderr));
+  }
+  // eslint-disable-next-line no-console -- intentional diagnostics for git/rg failures
+  console.warn(parts.join(' '));
+}
 
 function getStateKey(options: CrawlOptions): string {
   return [
@@ -66,12 +135,23 @@ interface ChangeState {
 
 const changeStateMap = new Map<string, ChangeState>();
 
-const resolveGitDirCache = new Map<string, string | null>();
-const canonicalizePathCache = new Map<string, string>();
+const resolveGitDirCache = new Map<string, Timestamped<string | null>>();
+const canonicalizePathCache = new Map<string, Timestamped<string>>();
+
+function evictChangeStateIfNeeded(): void {
+  while (changeStateMap.size >= MAX_CHANGE_STATE_ENTRIES) {
+    const oldest = changeStateMap.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    changeStateMap.delete(oldest);
+    lastRebuildTime.delete(oldest);
+  }
+}
 
 function resolveGitDir(crawlDirectory: string): string | null {
   const cacheKey = normalizePath(path.resolve(crawlDirectory));
-  const cached = resolveGitDirCache.get(cacheKey);
+  const cached = pathCacheGet(resolveGitDirCache, cacheKey);
   if (cached !== undefined) {
     return cached;
   }
@@ -85,7 +165,7 @@ function resolveGitDir(crawlDirectory: string): string | null {
       const stat = fs.statSync(gitPath);
 
       if (stat.isDirectory()) {
-        resolveGitDirCache.set(cacheKey, gitPath);
+        pathCacheSet(resolveGitDirCache, cacheKey, gitPath);
         return gitPath;
       }
 
@@ -93,7 +173,7 @@ function resolveGitDir(crawlDirectory: string): string | null {
         const contents = fs.readFileSync(gitPath, 'utf8').trim();
         const match = contents.match(/^gitdir:\s*(.+)$/i);
         if (!match) {
-          resolveGitDirCache.set(cacheKey, null);
+          pathCacheSet(resolveGitDirCache, cacheKey, null);
           return null;
         }
 
@@ -101,13 +181,12 @@ function resolveGitDir(crawlDirectory: string): string | null {
         const resolved = path.isAbsolute(resolvedGitDir)
           ? resolvedGitDir
           : path.resolve(current, resolvedGitDir);
-        resolveGitDirCache.set(cacheKey, resolved);
+        pathCacheSet(resolveGitDirCache, cacheKey, resolved);
         return resolved;
       }
     } catch (error) {
       const errno = error as NodeJS.ErrnoException;
       if (errno.code !== 'ENOENT') {
-        resolveGitDirCache.set(cacheKey, null);
         return null;
       }
     }
@@ -119,7 +198,7 @@ function resolveGitDir(crawlDirectory: string): string | null {
     current = parent;
   }
 
-  resolveGitDirCache.set(cacheKey, null);
+  pathCacheSet(resolveGitDirCache, cacheKey, null);
   return null;
 }
 
@@ -164,6 +243,7 @@ function updateChangeState(
   untrackedFiles?: string[],
   deletedFiles?: string[],
 ): void {
+  evictChangeStateIfNeeded();
   const mtime = getGitRootMtime(crawlDirectory);
   changeStateMap.set(stateKey, {
     gitRootMtimeMs: mtime,
@@ -228,16 +308,32 @@ function runCommand(
       resolve({ success, lines: resultLines });
     };
 
+    let stderrBuf = '';
     let child;
     try {
       child = spawn(command, args, {
         cwd,
         windowsHide: true,
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
-    } catch {
+    } catch (err) {
+      logCommandProblem('command spawn threw', command, args, {
+        stderr: err instanceof Error ? err.message : String(err),
+      });
       finalize(false, []);
       return;
+    }
+
+    if (child.stderr) {
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => {
+        if (stderrBuf.length < STDERR_LOG_MAX_CHARS) {
+          stderrBuf += chunk;
+          if (stderrBuf.length > STDERR_LOG_MAX_CHARS) {
+            stderrBuf = stderrBuf.slice(0, STDERR_LOG_MAX_CHARS);
+          }
+        }
+      });
     }
 
     const stopProcess = (): void => {
@@ -318,8 +414,9 @@ function runCommand(
       if (timeout) {
         clearTimeout(timeout);
       }
-      // eslint-disable-next-line no-console -- surfaced for spawn diagnostics (ENOENT, EACCES, …)
-      console.warn('[crawler] command spawn failed:', command, err.code ?? err);
+      logCommandProblem('command spawn failed', command, args, {
+        stderr: `${String(err.code ?? '')} ${String(err)}`.trim(),
+      });
       finalize(false, []);
     });
 
@@ -329,6 +426,10 @@ function runCommand(
       }
 
       if (timedOut) {
+        logCommandProblem('command timed out', command, args, {
+          code,
+          stderr: stderrBuf,
+        });
         finalize(false, []);
         return;
       }
@@ -340,7 +441,14 @@ function runCommand(
 
       flushRemainder();
 
-      finalize(code === 0, code === 0 ? lines : []);
+      const ok = code === 0;
+      if (!ok) {
+        logCommandProblem('command failed', command, args, {
+          code,
+          stderr: stderrBuf,
+        });
+      }
+      finalize(ok, ok ? lines : []);
     });
   });
 }
@@ -374,19 +482,18 @@ function normalizeForComparison(p: string): string {
 function canonicalizePath(p: string): string {
   const resolvedInput = path.resolve(p);
   const cacheKey = normalizePath(resolvedInput);
-  const hit = canonicalizePathCache.get(cacheKey);
+  const hit = pathCacheGet(canonicalizePathCache, cacheKey);
   if (hit !== undefined) {
     return hit;
   }
 
   try {
     const out = fs.realpathSync.native(resolvedInput);
-    canonicalizePathCache.set(cacheKey, out);
+    pathCacheSet(canonicalizePathCache, cacheKey, out);
     return out;
   } catch {
-    const fallback = resolvedInput;
-    canonicalizePathCache.set(cacheKey, fallback);
-    return fallback;
+    pathCacheSet(canonicalizePathCache, cacheKey, resolvedInput);
+    return resolvedInput;
   }
 }
 
@@ -413,15 +520,21 @@ function isValidIgnorePath(relativePath: string): boolean {
   );
 }
 
-function toIgnoreRelativePath(
-  baseDir: string,
-  candidatePath: string,
+/** Relative path from crawl root for ignore checks; avoids symlink canonicalization (fdir hot path). */
+function toFdirExcludeRelativePath(
+  crawlDirectory: string,
+  dirPath: string,
 ): string | null {
-  const absoluteCandidate = path.isAbsolute(candidatePath)
-    ? candidatePath
-    : path.join(baseDir, candidatePath);
-  const relativePath = getPosixRelative(baseDir, absoluteCandidate);
-  return isValidIgnorePath(relativePath) ? relativePath : null;
+  const base = path.resolve(crawlDirectory);
+  const absoluteCandidate = path.isAbsolute(dirPath)
+    ? dirPath
+    : path.join(base, dirPath);
+  let rel = path.relative(base, absoluteCandidate);
+  rel = toPosixPath(rel);
+  if (!rel || rel.startsWith('..') || path.posix.isAbsolute(rel)) {
+    return null;
+  }
+  return isValidIgnorePath(rel) ? rel : null;
 }
 
 function getEntryDepth(entry: string): number {
@@ -649,14 +762,15 @@ async function scanWorkingTreeForChange(
   crawlDirectory: string,
   useGitignore: boolean,
 ): Promise<WorkingTreeChangeScan> {
+  const gitRoot = await findGitRoot(crawlDirectory);
+
   if (
     state.untrackedFingerprint === null &&
     state.deletedFingerprint === null
   ) {
-    return { changed: false };
+    return gitRoot ? { changed: true } : { changed: false };
   }
 
-  const gitRoot = await findGitRoot(crawlDirectory);
   if (!gitRoot) {
     return { changed: true };
   }
@@ -912,7 +1026,7 @@ async function crawlWithFdir(options: CrawlOptions): Promise<string[]> {
       .withDirs()
       .withPathSeparator('/')
       .exclude((_, dirPath) => {
-        const relativePath = toIgnoreRelativePath(
+        const relativePath = toFdirExcludeRelativePath(
           options.crawlDirectory,
           dirPath,
         );
@@ -949,14 +1063,17 @@ async function crawlWithFdir(options: CrawlOptions): Promise<string[]> {
 export async function crawl(options: CrawlOptions): Promise<string[]> {
   const stateKey = getStateKey(options);
 
-  if (options.cache) {
-    const cacheKey = cache.getCacheKey(
+  const cacheKeyForCurrentOptions = (): string =>
+    cache.getCacheKey(
       options.crawlDirectory,
       options.ignore.getFingerprint(),
       options.maxDepth,
       options.maxFiles,
       options.useGitignore !== false,
     );
+
+  if (options.cache) {
+    const cacheKey = cacheKeyForCurrentOptions();
     const cachedResults = cache.read(cacheKey);
     if (cachedResults) {
       return cachedResults;
@@ -995,14 +1112,11 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
     const results = gitResult.files;
 
     if (options.cache) {
-      const cacheKey = cache.getCacheKey(
-        options.crawlDirectory,
-        options.ignore.getFingerprint(),
-        options.maxDepth,
-        options.maxFiles,
-        options.useGitignore !== false,
+      cache.write(
+        cacheKeyForCurrentOptions(),
+        results,
+        options.cacheTtl * 1000,
       );
-      cache.write(cacheKey, results, options.cacheTtl * 1000);
     }
 
     return results;
@@ -1019,14 +1133,11 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
       const results = rgResult.files;
 
       if (options.cache) {
-        const cacheKey = cache.getCacheKey(
-          options.crawlDirectory,
-          options.ignore.getFingerprint(),
-          options.maxDepth,
-          options.maxFiles,
-          options.useGitignore !== false,
+        cache.write(
+          cacheKeyForCurrentOptions(),
+          results,
+          options.cacheTtl * 1000,
         );
-        cache.write(cacheKey, results, options.cacheTtl * 1000);
       }
 
       return results;
@@ -1039,14 +1150,11 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
   recordRebuild(stateKey);
 
   if (options.cache) {
-    const cacheKey = cache.getCacheKey(
-      options.crawlDirectory,
-      options.ignore.getFingerprint(),
-      options.maxDepth,
-      options.maxFiles,
-      options.useGitignore !== false,
+    cache.write(
+      cacheKeyForCurrentOptions(),
+      limitedResults,
+      options.cacheTtl * 1000,
     );
-    cache.write(cacheKey, limitedResults, options.cacheTtl * 1000);
   }
 
   return limitedResults;

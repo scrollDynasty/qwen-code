@@ -537,6 +537,61 @@ describe('crawler', () => {
       expect(readSpy).toHaveBeenCalledTimes(3);
       expect(writeSpy).toHaveBeenCalledTimes(2); // No new write
     });
+
+    it('should hit cache when crawling a git repo twice', async () => {
+      tmpDir = await createTmpDir({ 'tracked.js': '' });
+      await initGitRepo(tmpDir);
+
+      cache.clear();
+      const ignore = loadIgnoreRules({
+        projectRoot: tmpDir,
+        useGitignore: false,
+        useQwenignore: false,
+        ignoreDirs: [],
+      });
+      const options = {
+        crawlDirectory: tmpDir,
+        cwd: tmpDir,
+        ignore,
+        cache: true,
+        cacheTtl: 3600,
+      };
+
+      const writeSpy = vi.spyOn(cache, 'write');
+
+      const first = await crawl(options);
+      expect(first.length).toBeGreaterThan(0);
+
+      const second = await crawl(options);
+      expect(second).toEqual(first);
+      expect(writeSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('should hit cache for ripgrep path when not a git repo', async () => {
+      tmpDir = await createTmpDir({ 'only.js': '' });
+
+      cache.clear();
+      const ignore = loadIgnoreRules({
+        projectRoot: tmpDir,
+        useGitignore: false,
+        useQwenignore: false,
+        ignoreDirs: [],
+      });
+      const options = {
+        crawlDirectory: tmpDir,
+        cwd: tmpDir,
+        ignore,
+        cache: true,
+        cacheTtl: 3600,
+      };
+
+      const writeSpy = vi.spyOn(cache, 'write');
+
+      await crawl(options);
+      await crawl(options);
+
+      expect(writeSpy).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('with maxDepth', () => {
@@ -1017,6 +1072,48 @@ describe('crawler', () => {
       expect(results).toContain('keep.txt');
       expect(rgArgsSeen).toHaveLength(1);
       expect(rgArgsSeen[0]).toContain('--no-ignore');
+    });
+
+    it('should omit --no-ignore on ripgrep when useGitignore is true (default)', async () => {
+      const rgArgsSeen: string[][] = [];
+
+      __setCommandRunnerForTests(async (command, args) => {
+        if (command === 'git') {
+          return { success: false, lines: [] };
+        }
+
+        if (command === 'rg') {
+          rgArgsSeen.push(args);
+          return { success: true, lines: ['keep.txt'] };
+        }
+
+        return { success: false, lines: [] };
+      });
+
+      tmpDir = await createTmpDir({
+        '.gitignore': '*.log',
+        'keep.log': '',
+        'keep.txt': '',
+      });
+
+      const ignore = loadIgnoreRules({
+        projectRoot: tmpDir,
+        useGitignore: true,
+        useQwenignore: false,
+        ignoreDirs: [],
+      });
+
+      await crawl({
+        crawlDirectory: tmpDir,
+        cwd: tmpDir,
+        ignore,
+        cache: false,
+        cacheTtl: 0,
+        useGitignore: true,
+      });
+
+      expect(rgArgsSeen).toHaveLength(1);
+      expect(rgArgsSeen[0]).not.toContain('--no-ignore');
     });
   });
 
