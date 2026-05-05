@@ -136,7 +136,6 @@ interface ChangeState {
 const changeStateMap = new Map<string, ChangeState>();
 
 const resolveGitDirCache = new Map<string, Timestamped<string | null>>();
-const canonicalizePathCache = new Map<string, Timestamped<string>>();
 
 function evictChangeStateIfNeeded(): void {
   while (changeStateMap.size >= MAX_CHANGE_STATE_ENTRIES) {
@@ -464,44 +463,28 @@ export function __resetCrawlerStateForTests(): void {
   lastRebuildTime.clear();
   changeStateMap.clear();
   resolveGitDirCache.clear();
-  canonicalizePathCache.clear();
 }
 
 function normalizePath(p: string): string {
   return toPosixPath(p);
 }
 
-function normalizeForComparison(p: string): string {
-  const normalized = normalizePath(p);
-  if (/^[A-Z]:/.test(normalized)) {
-    return `${normalized[0].toLowerCase()}${normalized.slice(1)}`;
-  }
-  return normalized;
-}
-
-function canonicalizePath(p: string): string {
-  const resolvedInput = path.resolve(p);
-  const cacheKey = normalizePath(resolvedInput);
-  const hit = pathCacheGet(canonicalizePathCache, cacheKey);
-  if (hit !== undefined) {
-    return hit;
-  }
-
-  try {
-    const out = fs.realpathSync.native(resolvedInput);
-    pathCacheSet(canonicalizePathCache, cacheKey, out);
-    return out;
-  } catch {
-    pathCacheSet(canonicalizePathCache, cacheKey, resolvedInput);
-    return resolvedInput;
-  }
-}
-
 function getPosixRelative(from: string, to: string): string {
-  const canonicalFrom = normalizeForComparison(canonicalizePath(from));
-  const canonicalTo = normalizeForComparison(canonicalizePath(to));
-  const relative = path.posix.relative(canonicalFrom, canonicalTo);
-  return relative === '' ? '.' : relative;
+  let fromAbs: string;
+  let toAbs: string;
+  try {
+    fromAbs = fs.realpathSync.native(from);
+  } catch {
+    fromAbs = path.resolve(from);
+  }
+  try {
+    toAbs = fs.realpathSync.native(to);
+  } catch {
+    toAbs = path.resolve(to);
+  }
+  const relative = path.relative(fromAbs, toAbs);
+  const posixRel = toPosixPath(relative);
+  return posixRel === '' ? '.' : posixRel;
 }
 
 function isValidIgnorePath(relativePath: string): boolean {
@@ -577,6 +560,7 @@ function stripCrawlDirectoryPrefix(
   return entry;
 }
 
+/** Depth limits apply here; git/rg streaming may still count maxFiles against paths later dropped by depth. */
 function applyMaxDepthLimit(
   results: string[],
   maxDepth?: number,
@@ -702,7 +686,9 @@ async function listUntrackedFiles(
   relativeToGitRoot: string,
   useGitignore: boolean,
 ): Promise<string[] | null> {
-  const untrackedArgs = ['ls-files', '--others'];
+  // Global `--literal-pathspecs` (before `ls-files`) matches Git CLI expectations on Windows;
+  // pathspec characters are then treated literally for optional trailing paths.
+  const untrackedArgs = ['--literal-pathspecs', 'ls-files', '--others'];
   if (useGitignore) {
     untrackedArgs.push('--exclude-standard');
   }
@@ -727,7 +713,7 @@ async function listDeletedTrackedFiles(
   gitRoot: string,
   relativeToGitRoot: string,
 ): Promise<string[] | null> {
-  const deletedArgs = ['ls-files', '--deleted'];
+  const deletedArgs = ['--literal-pathspecs', 'ls-files', '--deleted'];
   if (relativeToGitRoot && relativeToGitRoot !== '.') {
     deletedArgs.push(relativeToGitRoot);
   }
@@ -841,7 +827,7 @@ async function crawlWithGitLsFiles(
   const dirFilter = options.ignore.getDirectoryFilter();
   const fileFilter = options.ignore.getFileFilter();
 
-  const trackedArgs = ['ls-files', '--cached'];
+  const trackedArgs = ['--literal-pathspecs', 'ls-files', '--cached'];
   if (relativeToGitRoot && relativeToGitRoot !== '.') {
     trackedArgs.push(relativeToGitRoot);
   }
@@ -860,6 +846,14 @@ async function crawlWithGitLsFiles(
 
     const normalizedFile = normalizePath(file);
     if (deletedSet.has(normalizedFile)) {
+      return true;
+    }
+
+    if (
+      relativeToGitRoot &&
+      relativeToGitRoot !== '.' &&
+      normalizedFile === relativeToGitRoot
+    ) {
       return true;
     }
 
@@ -1122,26 +1116,24 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
     return results;
   }
 
-  if (!gitResult.isGitRepo) {
-    const rgResult = await crawlWithRipgrep(
-      stateKey,
-      options.crawlDirectory,
-      options.cwd,
-      options,
-    );
-    if (rgResult.success) {
-      const results = rgResult.files;
+  const rgResult = await crawlWithRipgrep(
+    stateKey,
+    options.crawlDirectory,
+    options.cwd,
+    options,
+  );
+  if (rgResult.success) {
+    const results = rgResult.files;
 
-      if (options.cache) {
-        cache.write(
-          cacheKeyForCurrentOptions(),
-          results,
-          options.cacheTtl * 1000,
-        );
-      }
-
-      return results;
+    if (options.cache) {
+      cache.write(
+        cacheKeyForCurrentOptions(),
+        results,
+        options.cacheTtl * 1000,
+      );
     }
+
+    return results;
   }
 
   const fdirResults = await crawlWithFdir(options);
@@ -1160,6 +1152,12 @@ export async function crawl(options: CrawlOptions): Promise<string[]> {
   return limitedResults;
 }
 
+/**
+ * Caps the number of listed entries. When the caller passes a small `maxFiles`,
+ * the naive prefix slice can contain only `.` and synthetic directory rows
+ * before the first file path; in that case we extend through the first file row
+ * so the crawl does not return an empty-looking tree (see crawler tests).
+ */
 function applyMaxFilesLimit(results: string[], maxFiles?: number): string[] {
   if (maxFiles === undefined || results.length <= maxFiles) {
     return results;

@@ -1315,7 +1315,7 @@ describe('crawler', () => {
             return { success: true, lines: [worktreeDir] };
           }
 
-          if (args[0] === 'ls-files' && args.includes('--cached')) {
+          if (args.includes('ls-files') && args.includes('--cached')) {
             return {
               success: true,
               lines: includeExtraFile
@@ -1324,7 +1324,7 @@ describe('crawler', () => {
             };
           }
 
-          if (args[0] === 'ls-files' && args.includes('--others')) {
+          if (args.includes('ls-files') && args.includes('--others')) {
             return { success: true, lines: [] };
           }
 
